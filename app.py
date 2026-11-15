@@ -47,6 +47,7 @@ class SupabaseStore:
 
     def __init__(self, url, key):
         self.base = url.rstrip("/") + "/rest/v1/members"
+        self.entries = url.rstrip("/") + "/rest/v1/entries"
         self.headers = {
             "apikey": key,
             "Authorization": f"Bearer {key}",
@@ -73,6 +74,21 @@ class SupabaseStore:
                            params={"username": f"eq.{username}"}, data=json.dumps(fields), timeout=15)
         r.raise_for_status()
 
+    def add_entry(self, kind, username, data):
+        """Add a review, post, reply or tracker log to the `entries` table."""
+        r = requests.post(self.entries, headers={**self.headers, "Prefer": "return=minimal"},
+                          data=json.dumps({"kind": kind, "username": username, "data": data}), timeout=15)
+        r.raise_for_status()
+
+    def list_entries(self, kind, username=None, limit=300):
+        """Newest entries of one kind, optionally for one member."""
+        params = {"kind": f"eq.{kind}", "select": "*", "order": "created_at.desc", "limit": str(limit)}
+        if username:
+            params["username"] = f"eq.{username}"
+        r = requests.get(self.entries, headers=self.headers, params=params, timeout=15)
+        r.raise_for_status()
+        return r.json()
+
     def all(self):
         """Return every member (without password hashes)."""
         r = requests.get(self.base, headers=self.headers, params={
@@ -91,6 +107,9 @@ class SQLiteStore:
                 username TEXT PRIMARY KEY, first_name TEXT, pw_hash TEXT,
                 created_at TEXT, updated_at TEXT,
                 quiz TEXT, details TEXT, routine TEXT, feedback TEXT)""")
+            c.execute("""CREATE TABLE IF NOT EXISTS entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, username TEXT,
+                created_at TEXT, data TEXT)""")
 
     def _conn(self):
         c = sqlite3.connect(self.path)
@@ -123,6 +142,22 @@ class SQLiteStore:
         sets = ",".join(f"{k}=?" for k in fields)
         with self._conn() as c:
             c.execute(f"UPDATE members SET {sets} WHERE username=?", (*fields.values(), username))
+
+    def add_entry(self, kind, username, data):
+        """Add a review, post, reply or tracker log."""
+        with self._conn() as c:
+            c.execute("INSERT INTO entries (kind, username, created_at, data) VALUES (?,?,?,?)",
+                      (kind, username, now_iso(), json.dumps(data)))
+
+    def list_entries(self, kind, username=None, limit=300):
+        """Newest entries of one kind, optionally for one member."""
+        q, args = "SELECT * FROM entries WHERE kind=?", [kind]
+        if username:
+            q += " AND username=?"
+            args.append(username)
+        with self._conn() as c:
+            rows = c.execute(q + " ORDER BY id DESC LIMIT ?", (*args, limit)).fetchall()
+        return [{**dict(r), "data": json.loads(r["data"])} for r in rows]
 
     def all(self):
         """Return every member (without password hashes)."""
@@ -415,7 +450,7 @@ def quiz_tab(member):
             quiz = {"type": t, "poro": p, "problem": prob, "wash": w, "budget": b, "at": now_iso()}
             routine = build_routine(quiz, member.get("details"))
             STORE.update(member["username"], {"quiz": quiz, "routine": routine, "updated_at": now_iso()})
-            st.session_state.flash = "Your routine is ready. Open the My routine tab."
+            st.session_state.flash = "Your routine is ready below."
             st.rerun()
 
 
@@ -517,6 +552,238 @@ def preview_tab(title, text, cards):
             st.markdown(f"**{heading}**")
             st.write(body)
 
+
+# --------------------------------------------------------------------------
+# Community features: products, community board, tracker
+# --------------------------------------------------------------------------
+
+CATEGORIES = ["Shampoo", "Conditioner or mask", "Leave-in", "Curl cream", "Gel or mousse", "Oil or butter", "Scalp care", "Other"]
+TOPICS = ["Question", "Wash day", "Product tip", "Before / after", "Other"]
+MD_SPECIAL = re.compile(r"([\\`*_{}\[\]()#+\-.!|<>~])")
+
+
+def safe(text):
+    """Escape user text so it shows as plain text in Markdown."""
+    return MD_SPECIAL.sub(r"\\\1", str(text))
+
+
+def hair_label(member_or_quiz):
+    """Short hair-type label for a member or quiz dict."""
+    q = member_or_quiz.get("quiz") if "quiz" in member_or_quiz else member_or_quiz
+    if not isinstance(q, dict):
+        return "Hair type not set"
+    return HAIR_TYPES[q["type"]].split(":")[0].split(" (")[0]
+
+
+def ago(iso):
+    """'3 h ago' style time label."""
+    try:
+        t = dt.datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    mins = int((dt.datetime.now(dt.timezone.utc) - t).total_seconds() // 60)
+    if mins < 60:
+        return f"{max(mins, 1)} min ago"
+    if mins < 1440:
+        return f"{mins // 60} h ago"
+    return f"{mins // 1440} d ago"
+
+
+def home_tab(member):
+    """Startup home: what Curl Check does, live community numbers, next steps."""
+    st.subheader(f"Hi {member['first_name']} 👋")
+    st.write("Curl Check helps people with wavy, curly, coily hair and locs stop wasting money on products "
+             "that don't suit them. Get a routine made for your hair, see what works for people like you, "
+             "and track your results.")
+    members = STORE.all()
+    reviews = STORE.list_entries("review")
+    posts = STORE.list_entries("post")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Members", len(members))
+    c2.metric("Product reviews", len(reviews))
+    c3.metric("Community posts", len(posts))
+
+    st.markdown("#### What you can do")
+    steps = [
+        ("My routine", "Take the 1-minute quiz and get 3 steps, products for your budget and one habit to stop.",
+         bool(member.get("routine"))),
+        ("Products", "Rate the products you use and see ratings from people with your hair type.",
+         any(r["username"] == member["username"] for r in reviews)),
+        ("Community", "Ask a question or share what worked, with no sponsored posts.",
+         any(p["username"] == member["username"] for p in posts)),
+        ("Tracker", "Log each wash day to see which products give you the best results.", False),
+    ]
+    for title, text, done in steps:
+        with st.container(border=True):
+            st.markdown(f"{'✅' if done else '⬜'} **{title}**")
+            st.caption(text)
+
+
+def routine_page(member):
+    """Quiz if needed, otherwise the routine with an option to retake."""
+    if member.get("routine"):
+        routine_tab(member)
+        with st.expander("Retake the quiz"):
+            quiz_tab(member)
+    else:
+        quiz_tab(member)
+
+
+def products_tab(member):
+    """Members rate products; ratings can be filtered to people with the same hair type."""
+    st.subheader("Products rated by people like you")
+    st.caption("Real reviews from Curl Check members. No sponsored ratings.")
+
+    with st.expander("➕ Rate a product you've used", expanded=False):
+        with st.form("review", clear_on_submit=True):
+            name = st.text_input("Product name", placeholder="e.g. Cantu Shea Butter Leave-In")
+            cat = st.selectbox("Type", CATEGORIES)
+            stars = st.slider("Your rating", 1, 5, 4)
+            again = st.radio("Would you buy it again?", ["Yes", "No"], horizontal=True)
+            note = st.text_area("What happened? (optional)", max_chars=300)
+            if st.form_submit_button("Post my review", type="primary"):
+                if len(name.strip()) < 3:
+                    st.error("Add the product name.")
+                else:
+                    q = member.get("quiz") or {}
+                    STORE.add_entry("review", member["username"], {
+                        "product": name.strip()[:80], "category": cat, "stars": int(stars),
+                        "again": again == "Yes", "note": note.strip()[:300], "first_name": member["first_name"],
+                        "hair": q.get("type"), "poro": q.get("poro")})
+                    st.session_state.flash = "Thanks! Your review is posted."
+                    st.rerun()
+
+    reviews = STORE.list_entries("review")
+    if not reviews:
+        st.info("No reviews yet. Be the first to rate a product you use.")
+        return
+    my_type = (member.get("quiz") or {}).get("type")
+    only_mine = st.toggle(f"Only people with my hair type ({hair_label(member)})", value=bool(my_type),
+                          disabled=not my_type)
+    if only_mine and my_type:
+        reviews = [r for r in reviews if r["data"].get("hair") == my_type]
+    if not reviews:
+        st.info("No reviews from people with your hair type yet. Turn the filter off to see all.")
+        return
+
+    # Group by product name
+    groups = {}
+    for r in reviews:
+        groups.setdefault(r["data"]["product"].strip().lower(), []).append(r)
+    ranked = sorted(groups.values(), key=lambda g: (-sum(x["data"]["stars"] for x in g) / len(g), -len(g)))
+    for g in ranked:
+        d0 = g[0]["data"]
+        avg = sum(x["data"]["stars"] for x in g) / len(g)
+        again = sum(1 for x in g if x["data"].get("again"))
+        with st.container(border=True):
+            st.markdown(f"**{safe(d0['product'])}** · {d0['category']}")
+            st.markdown(f"{'★' * round(avg)}{'☆' * (5 - round(avg))} **{avg:.1f}** from {len(g)} "
+                        f"review{'s' if len(g) > 1 else ''} · {again} would buy again")
+            for x in g[:3]:
+                d = x["data"]
+                who = f"{safe(d.get('first_name', 'Member'))} · {HAIR_TYPES.get(d.get('hair'), 'Hair type not set').split(':')[0]}"
+                st.caption(f"{who} · {'★' * d['stars']} · {ago(x.get('created_at'))}")
+                if d.get("note"):
+                    st.markdown(f"> {safe(d['note'])}")
+
+
+def community_tab(member):
+    """A simple board: posts with replies."""
+    st.subheader("Community")
+    st.caption("Ask questions and share what really worked. Be kind: no ads, no body-shaming.")
+
+    with st.expander("✏️ Write a post", expanded=False):
+        with st.form("post", clear_on_submit=True):
+            topic = st.selectbox("Topic", TOPICS)
+            text = st.text_area("Your post", max_chars=600, placeholder="e.g. What do you use to stop frizz in humid weather?")
+            if st.form_submit_button("Post", type="primary"):
+                if len(text.strip()) < 5:
+                    st.error("Write a bit more before posting.")
+                else:
+                    STORE.add_entry("post", member["username"], {
+                        "topic": topic, "text": text.strip()[:600], "first_name": member["first_name"],
+                        "hair": (member.get("quiz") or {}).get("type")})
+                    st.session_state.flash = "Posted!"
+                    st.rerun()
+
+    posts = STORE.list_entries("post")
+    if not posts:
+        st.info("No posts yet. Start the first conversation.")
+        return
+    replies = STORE.list_entries("reply")
+    by_post = {}
+    for r in replies:
+        by_post.setdefault(str(r["data"].get("post_id")), []).append(r)
+
+    topic_filter = st.selectbox("Show", ["All topics"] + TOPICS)
+    for p in posts:
+        d = p["data"]
+        if topic_filter != "All topics" and d.get("topic") != topic_filter:
+            continue
+        pid = str(p["id"])
+        with st.container(border=True):
+            hair = HAIR_TYPES.get(d.get("hair"), "Hair type not set").split(":")[0]
+            st.caption(f"**{safe(d.get('first_name', 'Member'))}** · {hair} · {d.get('topic')} · {ago(p.get('created_at'))}")
+            st.markdown(safe(d["text"]))
+            reps = sorted(by_post.get(pid, []), key=lambda r: str(r.get("created_at")))
+            for r in reps:
+                rd = r["data"]
+                st.markdown(f"↳ **{safe(rd.get('first_name', 'Member'))}:** {safe(rd['text'])}")
+            with st.form(f"reply-{pid}", clear_on_submit=True):
+                rep = st.text_input("Reply", key=f"rep-{pid}", label_visibility="collapsed", placeholder="Write a reply…")
+                if st.form_submit_button("Reply"):
+                    if rep.strip():
+                        STORE.add_entry("reply", member["username"], {
+                            "post_id": pid, "text": rep.strip()[:300], "first_name": member["first_name"]})
+                        st.rerun()
+
+
+def tracker_tab(member):
+    """Log wash days and see results over time."""
+    st.subheader("Wash-day tracker")
+    st.caption("Log each wash day. After a few weeks you'll see which routine and products work best.")
+    with st.form("log", clear_on_submit=True):
+        day = st.date_input("Date", value=dt.date.today(), max_value=dt.date.today())
+        used = st.text_input("Products used", placeholder="e.g. Cantu leave-in + gel")
+        result = st.slider("How did your hair turn out? (1 = bad, 5 = great)", 1, 5, 3)
+        note = st.text_input("Note (optional)", placeholder="e.g. less frizz, more definition")
+        if st.form_submit_button("Save wash day", type="primary"):
+            STORE.add_entry("log", member["username"], {
+                "day": day.isoformat(), "used": used.strip()[:120], "result": int(result), "note": note.strip()[:200]})
+            st.session_state.flash = "Wash day saved."
+            st.rerun()
+
+    logs = STORE.list_entries("log", username=member["username"])
+    if not logs:
+        st.info("No wash days logged yet.")
+        return
+    df = pd.DataFrame([{**l["data"]} for l in logs])
+    df["day"] = pd.to_datetime(df["day"])
+    df = df.sort_values("day")
+    c1, c2 = st.columns(2)
+    c1.metric("Wash days logged", len(df))
+    c2.metric("Average result", f"{df['result'].mean():.1f}/5")
+    if len(df) > 1:
+        st.line_chart(df.set_index("day")["result"], color="#4a1f47")
+    best = df.sort_values("result", ascending=False).iloc[0]
+    if best["used"]:
+        st.success(f"Your best result so far: **{safe(best['used'])}** ({best['result']}/5).")
+    st.dataframe(df.sort_values("day", ascending=False).rename(columns={
+        "day": "Date", "used": "Products", "result": "Result", "note": "Note"}),
+        hide_index=True, use_container_width=True)
+
+
+def profile_tab(member):
+    """Hair profile summary and optional details."""
+    q = member.get("quiz")
+    if q:
+        st.subheader("My hair profile")
+        st.write(f"**{HAIR_TYPES[q['type']].split(':')[0]}** · {POROSITY[q['poro']].split('(')[-1].rstrip(')')} · "
+                 f"main problem: {PROBLEMS[q['problem']].lower()} · budget {BUDGET[q['budget']]}")
+    details_tab(member)
+
 # --------------------------------------------------------------------------
 # Team dashboard (Traction and Impact)
 # --------------------------------------------------------------------------
@@ -543,6 +810,11 @@ def dashboard():
         c4.metric("Average usefulness", f"{fb['score'].mean():.1f}/10")
         c5.metric("Time saved (total)", f"{int((fb['minutes'] - 1).clip(lower=0).sum())} min")
         c6.metric("Avoided a wrong buy", int(fb["avoided"].sum()) if "avoided" in fb else 0)
+
+    c7, c8, c9 = st.columns(3)
+    c7.metric("Product reviews", len(STORE.list_entries("review")))
+    c8.metric("Community posts", len(STORE.list_entries("post")))
+    c9.metric("Wash days logged", len(STORE.list_entries("log")))
 
     st.markdown("**Traction: new accounts per day**")
     per_day = df.groupby("joined").size().rename("Accounts").to_frame()
@@ -602,23 +874,19 @@ def main():
     if st.session_state.get("flash"):
         st.success(st.session_state.pop("flash"))
 
-    tabs = st.tabs(["Quiz", "My routine", "My details", "Products", "Community"])
+    tabs = st.tabs(["Home", "My routine", "Products", "Community", "Tracker", "Profile"])
     with tabs[0]:
-        quiz_tab(member)
+        home_tab(member)
     with tabs[1]:
-        routine_tab(member)
+        routine_page(member)
     with tabs[2]:
-        details_tab(member)
+        products_tab(member)
     with tabs[3]:
-        preview_tab("Products that work for hair like yours",
-                    "Soon you will see products rated by people with your hair type and porosity, not by influencers.",
-                    [("Leave-in cream · Curly 3B · High porosity", "Ratings from people with your hair type will appear here."),
-                     ("Curl gel · Wavy 2C · Low porosity", "Ingredient check: we flag ingredients that are heavy for low-porosity hair.")])
+        community_tab(member)
     with tabs[4]:
-        preview_tab("Honest hair talk",
-                    "A space to share what really worked, with no sponsored posts and no filters.",
-                    [("Member · Coily 4C", "\"Wash day question: what do you use to stop shrinkage?\""),
-                     ("Member · Wavy 2B", "\"Before / after: 4 weeks on my Curl Check routine.\"")])
-
+        tracker_tab(member)
+    with tabs[5]:
+        profile_tab(member)
 
 main()
+st.markdown('<p style="text-align:center;color:#6e5a6c;font-size:.8rem;margin-top:2.5rem">Created by Sarah</p>', unsafe_allow_html=True)
