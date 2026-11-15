@@ -23,7 +23,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Curl Check", page_icon="🌀", layout="centered")
+st.set_page_config(page_title="Curl Check", page_icon="🌀", layout="centered", initial_sidebar_state="collapsed")
 
 # --------------------------------------------------------------------------
 # Storage
@@ -323,6 +323,9 @@ st.markdown("""
             display: grid; place-items: center; font-weight: 800; }
   .cc-stop { border-left: 4px solid #d98e1f; padding: .6rem .9rem; background: rgba(217,142,31,.08);
              border-radius: 6px; }
+  header[data-testid="stHeader"], [data-testid="stToolbar"], [data-testid="stDecoration"],
+  [data-testid="stSidebarCollapsedControl"], #MainMenu, footer { display: none !important; }
+  .block-container { padding-top: 1.5rem; max-width: 520px; }
   .cc-tag { display: inline-block; font-size: .72rem; font-weight: 700; letter-spacing: .06em;
             text-transform: uppercase; padding: .2rem .5rem; border: 1px dashed #888; border-radius: 6px;
             color: #888; }
@@ -569,20 +572,17 @@ def dashboard():
 
 def main():
     """Route between the login screen, the member app and the team dashboard."""
-    with st.sidebar:
-        st.markdown("**Team only**")
+    if "team" in st.query_params:
         admin_pw = _secret("ADMIN_PASSWORD")
-        if admin_pw:
-            entered = st.text_input("Dashboard password", type="password")
-            st.session_state.admin = bool(entered) and hmac.compare_digest(entered, admin_pw)
-        else:
-            st.caption("Set ADMIN_PASSWORD in the app secrets to unlock the dashboard.")
-            st.session_state.admin = False
-        if STORE_KIND == "local":
-            st.warning("Test mode: accounts are saved locally and can disappear. Add Supabase keys to keep them.")
-
-    if st.session_state.get("admin"):
-        dashboard()
+        st.markdown("**Team dashboard**")
+        if not admin_pw:
+            st.error("Set ADMIN_PASSWORD in the app secrets.")
+            return
+        entered = st.text_input("Team password", type="password")
+        if entered and hmac.compare_digest(entered, admin_pw):
+            dashboard()
+        elif entered:
+            st.error("Wrong password.")
         return
 
     user = st.session_state.get("user")
