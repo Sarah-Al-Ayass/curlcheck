@@ -192,12 +192,24 @@ def hash_password(password):
 
 def check_password(password, stored):
     """Return True if the password matches the stored 'salt$hash'."""
+    if isinstance(stored, str) and stored.startswith("temp:"):
+        stored = stored[5:]
     try:
         salt, digest = stored.split("$", 1)
     except (AttributeError, ValueError):
         return False
     test = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 200_000).hex()
     return hmac.compare_digest(test, digest)
+
+
+def is_temp(member):
+    """True if the member still has the temporary password the team gave them."""
+    return str(member.get("pw_hash", "")).startswith("temp:")
+
+
+def temp_password():
+    """A short, readable temporary password like 'curl-4821'."""
+    return "curl-" + "".join(secrets.choice("0123456789") for _ in range(4))
 
 
 def now_iso():
@@ -213,7 +225,7 @@ HAIR_TYPES = {"wavy": "Wavy (2A–2C): loose S-shapes", "curly": "Curly (3A–3C
               "coily": "Coily (4A–4C): tight coils or zig-zags", "locs": "Locs", "unsure": "Not sure"}
 POROSITY = {"low": "It floats (low porosity)", "medium": "It floats in the middle (medium porosity)",
             "high": "It sinks (high porosity)", "unsure": "I didn't do the test"}
-PROBLEMS = {"frizz": "Frizz", "dry": "Dryness", "break": "Breakage or split ends",
+PROBLEMS = {"frizz": "Frizz", "dry": "Dryness", "break": "Breakage or split ends", "lost": "I don't know what to buy",
             "define": "Curls not defined", "flat": "Flat, no volume", "scalp": "Itchy or flaky scalp"}
 WASH = {"daily": "Every day", "few": "2–3 times a week", "weekly": "Once a week", "rare": "Every 2 weeks or less"}
 BUDGET = {"low": "Under €10", "mid": "€10–€25", "high": "Over €25"}
@@ -252,6 +264,7 @@ PRODUCTS = {
 }
 
 STOP = {
+    "lost": "Stop buying a new product every time you see a trend. Use this routine for 4 weeks before changing anything.",
     "frizz": "Stop rubbing your hair with a bath towel. Squeeze it gently with a cotton T-shirt instead.",
     "dry": "Stop washing with hot water. Use lukewarm water and finish with a cool rinse.",
     "break": "Stop brushing dry hair. Detangle only when wet, with conditioner in, from the ends up.",
@@ -380,16 +393,34 @@ def brand():
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{3,20}$")
 
 
+def invite_quiz():
+    """Read quiz answers passed in a personal invite link (?name=&type=&poro=&problem=&wash=&budget=)."""
+    p = st.query_params
+    keys = {"type": HAIR_TYPES, "poro": POROSITY, "problem": PROBLEMS, "wash": WASH, "budget": BUDGET}
+    if not all(p.get(k) in opts for k, opts in keys.items()):
+        return None, p.get("name", "")
+    quiz = {k: p.get(k) for k in keys}
+    quiz["at"] = now_iso()
+    quiz["source"] = "invite"
+    return quiz, p.get("name", "")
+
+
 def auth_screen():
     """Log in or sign up."""
     brand()
+    invited_quiz, invited_name = invite_quiz()
+    if invited_quiz:
+        st.success(f"Hi {invited_name or 'there'}! Your quiz answers are saved. Create your account below to see your routine.")
     st.write("Find your hair routine in 1 minute: 3 steps, 2–3 products for your budget, and one habit to stop.")
-    login_tab, signup_tab = st.tabs(["Log in", "Create an account"])
+    if invited_quiz:
+        signup_tab, login_tab = st.tabs(["Create an account", "Log in"])
+    else:
+        login_tab, signup_tab = st.tabs(["Log in", "Create an account"])
 
     with login_tab:
         with st.form("login"):
-            u = st.text_input("Username").strip().lower()
-            pw = st.text_input("Password", type="password")
+            u = st.text_input("Username", autocomplete="username").strip().lower()
+            pw = st.text_input("Password", type="password", autocomplete="current-password")
             if st.form_submit_button("Log in", type="primary", use_container_width=True):
                 member = STORE.get(u) if u else None
                 if member and check_password(pw, member.get("pw_hash")):
@@ -400,9 +431,10 @@ def auth_screen():
 
     with signup_tab:
         with st.form("signup"):
-            first = st.text_input("First name").strip()
-            u = st.text_input("Choose a username", help="3–20 characters: lowercase letters, numbers, _ or .").strip().lower()
-            pw = st.text_input("Choose a password", type="password", help="At least 6 characters.")
+            first = st.text_input("First name", value=invited_name, autocomplete="given-name").strip()
+            u = st.text_input("Choose a username", help="3–20 characters: lowercase letters, numbers, _ or .", autocomplete="username").strip().lower()
+            pw = st.text_input("Choose a password", type="password", help="At least 6 characters.",
+                               autocomplete="new-password")
             agree = st.checkbox("I agree that Curl Check stores my hair answers to make my routine. "
                                 "I can ask the team to delete my account at any time.")
             if st.form_submit_button("Create my account", type="primary", use_container_width=True):
@@ -418,8 +450,14 @@ def auth_screen():
                     st.error("That username is taken. Try another one.")
                 else:
                     t = now_iso()
-                    STORE.create({"username": u, "first_name": first, "pw_hash": hash_password(pw),
-                                  "created_at": t, "updated_at": t})
+                    row = {"username": u, "first_name": first, "pw_hash": hash_password(pw),
+                           "created_at": t, "updated_at": t}
+                    if invited_quiz:
+                        row["quiz"] = invited_quiz
+                        row["routine"] = build_routine(invited_quiz)
+                    STORE.create(row)
+                    if invited_quiz:
+                        st.session_state.flash = "Your routine is ready in the My routine tab."
                     st.session_state.user = u
                     st.rerun()
 
@@ -775,6 +813,22 @@ def tracker_tab(member):
         hide_index=True, use_container_width=True)
 
 
+def change_password(member):
+    """Let a member change their password."""
+    with st.expander("Change my password"):
+        with st.form("change_pw", clear_on_submit=True):
+            old = st.text_input("Current password", type="password", autocomplete="current-password")
+            new = st.text_input("New password", type="password", autocomplete="new-password")
+            if st.form_submit_button("Change password"):
+                if not check_password(old, member.get("pw_hash")):
+                    st.error("Current password is wrong.")
+                elif len(new) < 6:
+                    st.error("New password must be at least 6 characters.")
+                else:
+                    STORE.update(member["username"], {"pw_hash": hash_password(new), "updated_at": now_iso()})
+                    st.success("Password changed.")
+
+
 def profile_tab(member):
     """Hair profile summary and optional details."""
     q = member.get("quiz")
@@ -783,15 +837,52 @@ def profile_tab(member):
         st.write(f"**{HAIR_TYPES[q['type']].split(':')[0]}** · {POROSITY[q['poro']].split('(')[-1].rstrip(')')} · "
                  f"main problem: {PROBLEMS[q['problem']].lower()} · budget {BUDGET[q['budget']]}")
     details_tab(member)
+    change_password(member)
 
 # --------------------------------------------------------------------------
 # Team dashboard (Traction and Impact)
 # --------------------------------------------------------------------------
 
 
+def add_members():
+    """Team tool: create accounts for people who took the Google Forms quiz, with temporary passwords."""
+    with st.expander("➕ Create accounts for quiz respondents"):
+        st.caption("One person per line: first name, hair type, porosity, problem, wash, budget. "
+                   "Hair type: wavy/curly/coily/locs/unsure. Porosity: low/medium/high/unsure. "
+                   "Problem: frizz/dry/break/define/flat/scalp/lost. Wash: daily/few/weekly/rare. Budget: low/mid/high.")
+        text = st.text_area("Paste lines", height=180, placeholder="Ines, wavy, unsure, define, few, mid")
+        if st.button("Create accounts", type="primary"):
+            made, problems = [], []
+            for line in text.strip().splitlines():
+                parts = [x.strip().lower() for x in line.split(",")]
+                if len(parts) != 6:
+                    problems.append(f"{line} (needs 6 values)")
+                    continue
+                name, t, p, prob, w, b = parts
+                if t not in HAIR_TYPES or p not in POROSITY or prob not in PROBLEMS or w not in WASH or b not in BUDGET:
+                    problems.append(f"{line} (a value isn't in the list)")
+                    continue
+                base = re.sub(r"[^a-z0-9]", "", name)[:16] or "member"
+                username, n = base, 2
+                while STORE.get(username):
+                    username, n = f"{base}{n}", n + 1
+                pw = temp_password()
+                quiz = {"type": t, "poro": p, "problem": prob, "wash": w, "budget": b, "at": now_iso(), "source": "google_form"}
+                now = now_iso()
+                STORE.create({"username": username, "first_name": name.title(), "pw_hash": "temp:" + hash_password(pw),
+                              "created_at": now, "updated_at": now, "quiz": quiz, "routine": build_routine(quiz)})
+                made.append({"First name": name.title(), "Username": username, "Temporary password": pw})
+            if made:
+                st.success(f"Created {len(made)} account(s). Copy this table now: the passwords are not shown again.")
+                st.table(pd.DataFrame(made))
+            for pr in problems:
+                st.error("Skipped: " + pr)
+
+
 def dashboard():
     """Numbers for the project report: members, routines and feedback."""
     st.subheader("Team dashboard")
+    add_members()
     rows = STORE.all()
     if not rows:
         st.info("No members yet.")
@@ -834,6 +925,7 @@ def dashboard():
         "Hair type": df["quiz"].apply(lambda q: HAIR_TYPES[q["type"]].split(":")[0] if isinstance(q, dict) else "–"),
         "Problem": df["quiz"].apply(lambda q: PROBLEMS[q["problem"]] if isinstance(q, dict) else "–"),
         "Usefulness": df["feedback"].apply(lambda f: f["score"] if isinstance(f, dict) else None),
+        "Logged in": df["username"].apply(lambda u: "yes" if not is_temp(STORE.get(u) or {}) else "not yet"),
     })
     st.dataframe(table, hide_index=True, use_container_width=True)
 
@@ -862,6 +954,31 @@ def main():
     if not member:
         st.session_state.pop("user", None)
         auth_screen()
+        return
+
+    if is_temp(member):
+        brand()
+        st.subheader(f"Welcome {member['first_name']}!")
+        st.write("Your routine is ready. First, choose your own password.")
+        with st.form("new_pw"):
+            pw1 = st.text_input("New password", type="password", autocomplete="new-password", help="At least 6 characters.")
+            pw2 = st.text_input("Type it again", type="password", autocomplete="new-password")
+            agree = st.checkbox("I agree that Curl Check stores my hair answers to make my routine. "
+                                "I can ask the team to delete my account at any time.")
+            if st.form_submit_button("Save and see my routine", type="primary", use_container_width=True):
+                if len(pw1) < 6:
+                    st.error("Password must be at least 6 characters.")
+                elif pw1 != pw2:
+                    st.error("The two passwords are different.")
+                elif not agree:
+                    st.error("Tick the box to continue.")
+                else:
+                    STORE.update(member["username"], {"pw_hash": hash_password(pw1), "updated_at": now_iso()})
+                    st.session_state.flash = "Password saved. Your routine is in the My routine tab."
+                    st.rerun()
+        if st.button("Log out"):
+            st.session_state.clear()
+            st.rerun()
         return
 
     top1, top2 = st.columns([4, 1])
